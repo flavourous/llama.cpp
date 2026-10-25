@@ -2003,10 +2003,8 @@ ggml_backend_sched_t ggml_backend_sched_new(
         sched->bufts[b] = bufts ? bufts[b] : ggml_backend_get_default_buffer_type(backends[b]);
         GGML_ASSERT(ggml_backend_supports_buft(backends[b], sched->bufts[b]));
 
-        if (sched->n_copies > 1) {
-            for (int c = 0; c < sched->n_copies; c++) {
-                sched->events[b][c] = ggml_backend_event_new(backends[b]->device);
-            }
+        for (int c = 0; c < sched->n_copies; c++) {
+            sched->events[b][c] = ggml_backend_event_new(backends[b]->device);
         }
     }
 

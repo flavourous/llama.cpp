@@ -84,6 +84,7 @@
 #include <initializer_list>
 #include <limits>
 #include <map>
+#include <tuple>
 #include <memory>
 #include <mutex>
 #include <cstdarg>
@@ -978,11 +979,69 @@ struct ggml_backend_cuda_comm_context {
 
     ggml_cuda_ar_pipeline *     ar_pipeline = nullptr;
 
+    bool                        timing_enabled = false;
+    std::vector<std::vector<cudaEvent_t>> allreduce_start_events;
+    std::vector<std::vector<cudaEvent_t>> allreduce_stop_events;
+    uint64_t                    allreduce_timed_calls = 0;
+    double                      allreduce_total_ms = 0.0;
+    std::vector<float>          allreduce_max_ms_by_call;
+    std::vector<int>            allreduce_type_by_call;
+    std::vector<int64_t>        allreduce_elements_by_call;
+    std::vector<size_t>         allreduce_bytes_by_call;
+
 #ifdef GGML_USE_NCCL
     std::vector<ncclComm_t>     comms;
 #endif // GGML_USE_NCCL
 
     ~ggml_backend_cuda_comm_context() {
+        for (size_t i = 0; i < allreduce_start_events.size(); ++i) {
+            ggml_cuda_set_device(dev_ids[i]);
+            for (size_t call = 0; call < allreduce_timed_calls; ++call) {
+                CUDA_CHECK(cudaEventSynchronize(allreduce_stop_events[i][call]));
+                float elapsed_ms = 0.0f;
+                CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms,
+                                               allreduce_start_events[i][call],
+                                               allreduce_stop_events[i][call]));
+                allreduce_max_ms_by_call[call] = std::max(allreduce_max_ms_by_call[call], elapsed_ms);
+                cudaEventDestroy(allreduce_start_events[i][call]);
+                cudaEventDestroy(allreduce_stop_events[i][call]);
+            }
+            for (size_t call = static_cast<size_t>(allreduce_timed_calls);
+                 call < allreduce_start_events[i].size(); ++call) {
+                cudaEventDestroy(allreduce_start_events[i][call]);
+                cudaEventDestroy(allreduce_stop_events[i][call]);
+            }
+        }
+        using allreduce_signature = std::tuple<int, int64_t, size_t>;
+        struct allreduce_bucket {
+            uint64_t calls = 0;
+            double total_ms = 0.0;
+            float min_ms = std::numeric_limits<float>::max();
+            float max_ms = 0.0f;
+        };
+        std::map<allreduce_signature, allreduce_bucket> allreduce_buckets;
+        for (size_t call = 0; call < allreduce_max_ms_by_call.size(); ++call) {
+            const float elapsed_ms = allreduce_max_ms_by_call[call];
+            allreduce_total_ms += elapsed_ms;
+            auto & bucket = allreduce_buckets[{allreduce_type_by_call[call],
+                                                allreduce_elements_by_call[call],
+                                                allreduce_bytes_by_call[call]}];
+            ++bucket.calls;
+            bucket.total_ms += elapsed_ms;
+            bucket.min_ms = std::min(bucket.min_ms, elapsed_ms);
+            bucket.max_ms = std::max(bucket.max_ms, elapsed_ms);
+        }
+        if (timing_enabled && allreduce_timed_calls > 0) {
+            GGML_LOG_INFO("ALLREDUCE_TIMING calls=%" PRIu64 " total_ms=%.3f scope=decode\n",
+                          allreduce_timed_calls, allreduce_total_ms);
+            for (const auto & [signature, bucket] : allreduce_buckets) {
+                const auto [type, elements, bytes] = signature;
+                GGML_LOG_INFO("ALLREDUCE_BUCKET type=%d elements=%" PRId64 " bytes=%zu calls=%" PRIu64
+                              " total_ms=%.3f avg_ms=%.6f min_ms=%.6f max_ms=%.6f\n",
+                              type, elements, bytes, bucket.calls, bucket.total_ms,
+                              bucket.total_ms / bucket.calls, bucket.min_ms, bucket.max_ms);
+            }
+        }
 #ifdef GGML_USE_NCCL
         for (ncclComm_t comm : comms) {
             NCCL_CHECK(ncclCommDestroy(comm));
@@ -1242,6 +1301,13 @@ static void * ggml_backend_cuda_comm_init(ggml_backend_t * backends, size_t n_ba
         }
     }
 
+    const char * timing_env = getenv("GGML_CUDA_ALLREDUCE_TIMING");
+    ret->timing_enabled = timing_env != nullptr && std::string(timing_env) == "1";
+    if (ret->timing_enabled) {
+        ret->allreduce_start_events.resize(ret->backends.size());
+        ret->allreduce_stop_events.resize(ret->backends.size());
+    }
+
     return ret;
 }
 
@@ -1252,7 +1318,47 @@ static bool ggml_backend_cuda_comm_allreduce_tensor(void * comm_ctx_v, struct gg
         return false;
     }
     auto * comm_ctx = static_cast<ggml_backend_cuda_comm_context *>(comm_ctx_v);
-    return comm_ctx->try_allreduce(comm_ctx, tensors);
+    const char * active_env = getenv("GGML_CUDA_ALLREDUCE_TIMING_ACTIVE");
+    const bool timing_active = comm_ctx->timing_enabled && active_env != nullptr &&
+                               std::string(active_env) == "1";
+    if (!timing_active) {
+        return comm_ctx->try_allreduce(comm_ctx, tensors);
+    }
+
+    const size_t n_backends = comm_ctx->backends.size();
+    const size_t event_index = static_cast<size_t>(comm_ctx->allreduce_timed_calls);
+    const int tensor_type = tensors[0] ? static_cast<int>(tensors[0]->type) : -1;
+    const int64_t tensor_elements = tensors[0] ? ggml_nelements(tensors[0]) : 0;
+    const size_t tensor_bytes = tensors[0] ? ggml_nbytes(tensors[0]) : 0;
+    for (size_t i = 0; i < n_backends; ++i) {
+        ggml_backend_cuda_context * cuda_ctx =
+            (ggml_backend_cuda_context *) comm_ctx->backends[i]->context;
+        ggml_cuda_set_device(cuda_ctx->device);
+        if (event_index == comm_ctx->allreduce_start_events[i].size()) {
+            cudaEvent_t start_event = nullptr;
+            cudaEvent_t stop_event = nullptr;
+            CUDA_CHECK(cudaEventCreateWithFlags(&start_event, cudaEventDefault));
+            CUDA_CHECK(cudaEventCreateWithFlags(&stop_event, cudaEventDefault));
+            comm_ctx->allreduce_start_events[i].push_back(start_event);
+            comm_ctx->allreduce_stop_events[i].push_back(stop_event);
+        }
+        CUDA_CHECK(cudaEventRecord(comm_ctx->allreduce_start_events[i][event_index], cuda_ctx->stream()));
+    }
+    const bool ok = comm_ctx->try_allreduce(comm_ctx, tensors);
+    if (ok) {
+        for (size_t i = 0; i < n_backends; ++i) {
+            ggml_backend_cuda_context * cuda_ctx =
+                (ggml_backend_cuda_context *) comm_ctx->backends[i]->context;
+            ggml_cuda_set_device(cuda_ctx->device);
+            CUDA_CHECK(cudaEventRecord(comm_ctx->allreduce_stop_events[i][event_index], cuda_ctx->stream()));
+        }
+        comm_ctx->allreduce_max_ms_by_call.push_back(0.0f);
+        comm_ctx->allreduce_type_by_call.push_back(tensor_type);
+        comm_ctx->allreduce_elements_by_call.push_back(tensor_elements);
+        comm_ctx->allreduce_bytes_by_call.push_back(tensor_bytes);
+        ++comm_ctx->allreduce_timed_calls;
+    }
+    return ok;
 }
 
 // host buffer type
