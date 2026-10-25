@@ -1007,6 +1007,14 @@ extern "C" {
             struct llama_context * ctx,
               struct llama_batch   batch);
 
+    // Experimental: submit independent decode batches concurrently on separate contexts.
+    // Each context must be distinct and safe to use from its own worker thread.
+    // The contexts may share a read-only model. Returns the first non-zero decode status.
+    LLAMA_API int32_t llama_decode_parallel(
+            struct llama_context ** ctxs,
+            const struct llama_batch * batches,
+                         size_t        n_contexts);
+
     //
     // Extended batch API
     //

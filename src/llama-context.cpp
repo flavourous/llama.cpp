@@ -20,7 +20,9 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <unordered_map>
+#include <vector>
 
 //
 // llama_context
@@ -4624,6 +4626,37 @@ int32_t llama_decode(
     }
 
     return ret;
+}
+
+int32_t llama_decode_parallel(
+        llama_context ** ctxs,
+        const llama_batch * batches,
+        size_t n_contexts) {
+    if (ctxs == nullptr || batches == nullptr || n_contexts == 0) {
+        return -1;
+    }
+
+    for (size_t i = 0; i < n_contexts; ++i) {
+        if (ctxs[i] == nullptr) return -1;
+    }
+
+    std::vector<int32_t> statuses(n_contexts, -1);
+    std::vector<std::thread> workers;
+    workers.reserve(n_contexts - 1);
+
+    for (size_t i = 1; i < n_contexts; ++i) {
+        workers.emplace_back([&, i] {
+            statuses[i] = llama_decode(ctxs[i], batches[i]);
+        });
+    }
+    statuses[0] = llama_decode(ctxs[0], batches[0]);
+
+    for (auto & worker : workers) worker.join();
+
+    for (const int32_t status : statuses) {
+        if (status != 0) return status;
+    }
+    return 0;
 }
 
 //
